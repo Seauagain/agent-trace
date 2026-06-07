@@ -27,6 +27,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "setup": "npm run build && npm link && node dist/cli.js install",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

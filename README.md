@@ -34,19 +34,30 @@ flowchart LR
   store -->|"POST /finalize | build"| out["RL / SFT JSONL"]
 ```
 
-## Install
+## Install (one line)
 
 ```bash
-npm install -g agent-trace   # CLI
-# or as a library:  npm install agent-trace
+curl -fsSL https://raw.githubusercontent.com/Seauagain/agent-trace/main/install.sh | bash
 ```
 
-### Auto-capture (install once, then just use `claude`)
+This clones + builds `agent-trace` under `~/.agent-trace/app`, links the CLI onto
+your `PATH`, and wires a transparent `claude` wrapper into your shell rc. Open a
+new shell (or `source ~/.bashrc`) and you're done — see *Auto-capture* below.
 
 ```bash
-agent-trace install          # adds a transparent `claude` wrapper to your shell rc
-source ~/.bashrc            # (or open a new shell)
+# wrap a different / extra command, or several at once:
+curl -fsSL https://raw.githubusercontent.com/Seauagain/agent-trace/main/install.sh | bash -s -- --command codex
+curl -fsSL https://raw.githubusercontent.com/Seauagain/agent-trace/main/install.sh | bash -s -- --all          # claude + codex
+curl -fsSL https://raw.githubusercontent.com/Seauagain/agent-trace/main/install.sh | bash -s -- --save-dir ~/traces
+
+# uninstall (remove wrappers + CLI symlink; add --purge to also delete captures):
+curl -fsSL https://raw.githubusercontent.com/Seauagain/agent-trace/main/uninstall.sh | bash
 ```
+
+**Local dev / from source:** clone the repo and run `npm run setup` (build +
+`npm link` + wrap `claude`). Use as a library with `npm install <git-url-or-path>`.
+
+### Auto-capture (then just use `claude`)
 
 After this, running `claude` interactively — or any launcher that calls it, like
 a `cc-dp` function — automatically routes through the capture proxy and saves
@@ -115,10 +126,10 @@ forwards to the public Anthropic/OpenAI endpoints, **or to your real
 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` if set**; override per family as needed.
 
 ```bash
-npx agent-trace capture --port 8787 --save-dir ./captures
+agent-trace capture --port 8787 --save-dir ./captures
 
 # point at a relay / custom gateway instead:
-npx agent-trace capture --port 8787 --save-dir ./captures \
+agent-trace capture --port 8787 --save-dir ./captures \
   --anthropic-base-url https://your-relay.example.com \
   --openai-base-url   https://your-relay.example.com
 # or one upstream for everything:
@@ -161,8 +172,8 @@ Run the agent, then build the trajectory and get samples:
 curl -X POST "http://127.0.0.1:8787/sessions/capture/finalize?format=sft" | jq
 
 # or, if you ran with --save-dir, reconstruct offline from the persisted records:
-npx agent-trace build ./captures --format sft --out sft.jsonl
-npx agent-trace build ./captures --format rl  --out rl.jsonl
+agent-trace build ./captures --format sft --out sft.jsonl
+agent-trace build ./captures --format rl  --out rl.jsonl
 ```
 
 ### Grouping into sessions
@@ -180,7 +191,7 @@ request to OpenAI chat, injects the training-signal params, and captures the
 exact sampled token ids.
 
 ```bash
-npx agent-trace serve \
+agent-trace serve \
   --inference-base-url http://localhost:8000 \
   --model Qwen/Qwen3-8B --engine vllm \
   --port 8080 --save-dir ./captures
