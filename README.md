@@ -13,11 +13,12 @@ The agent points its base URL at the proxy. Every request is **forwarded
 verbatim** to the API it already uses and captured losslessly as it crosses the
 wire — not reconstructed from lossy local logs. The agent never knows.
 
-## Two modes
+## Three modes
 
 | Mode | Command | Upstream | Captures | Use it for |
 | --- | --- | --- | --- | --- |
-| **capture** (passthrough) | `agent-trace capture` | the real API the agent uses (Anthropic / OpenAI, public or a relay) | full message-level trace: prompts, tool calls, tool results, reasoning | **any runtime, no backend** — SFT data + reward-attachable RL trajectories |
+| **capture** (passthrough) | `agent-trace capture` / `exec` | the real API the agent uses (Anthropic / OpenAI, public or a relay) | full message-level trace: prompts, tool calls, tool results, reasoning | **any base-URL-redirectable runtime, no backend** — SFT data + reward-attachable RL trajectories |
+| **forward** (TLS MITM) | `agent-trace forward` / `exec --mitm` | the real endpoint the agent hard-codes (e.g. Cursor's `*.cursor.sh`) | the above, decoded from the on-wire protocol (incl. Cursor's Connect-RPC/protobuf) | clients that **ignore `*_BASE_URL`** or speak a non-JSON wire (e.g. `cursor-agent`) |
 | **serve** (inference) | `agent-trace serve` | a model **you** host (vLLM / SGLang) | the above **plus** `token_ids` + per-token logprobs | token-level on-policy RL |
 
 > Frontier APIs don't return token ids / logprobs, so `capture` traces are
@@ -160,10 +161,9 @@ wire_api = "chat"
 env_key = "OPENAI_API_KEY"                  # your real key, forwarded upstream
 ```
 
-> ⚠️ **Cursor**: its Agent/Composer/Tab all run on Cursor's own servers, so a
-> local proxy can't see those calls. Only *Ask/Plan* (Cmd/Ctrl+L) honors
-> *Override OpenAI Base URL* and can be captured — the agentic trajectory can't.
-> For full coding traces use Claude Code / Codex, not Cursor.
+> **Cursor**: `cursor-agent` (and the IDE) hard-code their endpoint and talk
+> Connect-RPC/protobuf to `*.cursor.sh`, so they ignore `*_BASE_URL` and base-URL
+> capture can't see them. Use **forward (TLS MITM) mode** below instead.
 
 Run the agent, then build the trajectory and get samples:
 
@@ -182,6 +182,55 @@ All calls in one `capture` run land in a single session (id from `--session-id`,
 default `capture`). To split concurrently, have the harness send an
 `x-session-id` header or a `?session_id=` query param; the proxy groups by that
 and never treats your API key as a session id.
+
+## Quick start — `forward` (TLS MITM, for Cursor & pinned clients)
+
+Some clients can't be redirected with `*_BASE_URL`: `cursor-agent` hard-codes
+`*.cursor.sh` and speaks **Connect-RPC + protobuf** over HTTP/2, not OpenAI/
+Anthropic JSON. To capture those, `agent-trace` runs a **forward proxy** that
+the client trusts as `HTTPS_PROXY`, terminates TLS with a **local CA**, decodes
+the on-wire protocol back to OpenAI-chat, and saves it like any other capture.
+
+```bash
+# wrap any client; spins up the MITM proxy, trusts the CA, and routes the child:
+agent-trace exec --mitm --save-dir ./captures -- cursor-agent -p "fix the build"
+
+# then build trainable samples exactly like the other modes:
+agent-trace build ./captures --format sft --out sft.jsonl
+```
+
+`exec --mitm` sets the child's `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` (your shell
+is untouched) and prints the routing:
+
+```
+HTTPS_PROXY=http://127.0.0.1:43597  NODE_EXTRA_CA_CERTS=~/.agent-trace/ca/ca.pem
+intercepting: cursor.sh, anthropic.com, openai.com
+captured cursor_agent turn from agentn.global.api5.cursor.sh/agent.v1.AgentService/Run
+```
+
+Only the intercept allowlist (default `cursor.sh, anthropic.com, openai.com`) is
+decrypted; everything else (npm, telemetry, …) is blind-tunneled untouched. Add
+hosts with `--mitm-host a.com,b.com`, or `--mitm-all` to intercept everything.
+
+Run it **standalone** when you'd rather set the env yourself (e.g. the Cursor
+IDE, or a client in another shell):
+
+```bash
+agent-trace forward --port 8788 --save-dir ./captures
+agent-trace ca                 # print the CA path to trust
+agent-trace ca --print > agent-trace-ca.pem
+# in the client's environment:
+export HTTPS_PROXY=http://127.0.0.1:8788
+export NODE_EXTRA_CA_CERTS=~/.agent-trace/ca/ca.pem   # Node clients; or add to the OS trust store
+```
+
+The captured pair is **training-grade SFT**: the full system prompt, the message
+context, tool calls/results, and the assistant completion. Two wire limits carry
+over (same as Claude 4+): reasoning arrives as opaque `redacted-reasoning` blobs
+(no token-level CoT) and exact sampling params aren't on the wire — so this is
+SFT-grade, not token-level RL. The protobuf decode is schema-less and best-effort
+(Cursor can change it between releases); `agent-trace ca` regenerates a stable
+root, and decoders that don't recognize traffic simply ignore it.
 
 ## Quick start — serve (token-level RL)
 
@@ -249,6 +298,16 @@ const serve = new CaptureProxy({
 await serve.listen(8080);
 ```
 
+Forward (TLS MITM) mode for pinned / non-JSON clients:
+
+```ts
+import { ForwardProxy } from "agent-trace/proxy";
+
+const forward = new ForwardProxy({ saveDir: "./captures" });   // mints/loads a local CA
+const port = await forward.listen(0);
+// child env: HTTPS_PROXY=http://127.0.0.1:${port}, NODE_EXTRA_CA_CERTS=forward.caCertPath
+```
+
 ## Builders
 
 - **`per_request`** — one trace per captured completion. Simplest; every request
@@ -304,17 +363,20 @@ SFT sample (one per trace):
 
 Inbound API the agent speaks (and is forwarded verbatim in capture mode):
 
-| Inbound API | capture (passthrough) | serve (inference) |
-| --- | --- | --- |
-| OpenAI Chat Completions (`/v1/chat/completions`) | supported | supported |
-| Anthropic Messages (`/v1/messages`) | supported | supported |
-| OpenAI Responses (`/v1/responses`) | not yet — use Codex `wire_api = "chat"` | not yet |
-| Google Gemini | not yet | not yet |
+| Inbound API | capture (passthrough) | serve (inference) | forward (MITM) |
+| --- | --- | --- | --- |
+| OpenAI Chat Completions (`/v1/chat/completions`) | supported | supported | supported |
+| Anthropic Messages (`/v1/messages`) | supported | supported | supported |
+| Cursor agent (Connect-RPC/protobuf, `*.cursor.sh`) | n/a (pinned) | n/a | supported (best-effort, SFT-grade) |
+| OpenAI Responses (`/v1/responses`) | not yet — use Codex `wire_api = "chat"` | not yet | not yet |
+| Google Gemini | not yet | not yet | not yet |
 
 ## Requirements
 
 - Node.js >= 20 (uses global `fetch`).
 - **capture**: nothing else — your existing API key / relay.
+- **forward (MITM)**: the client must use `HTTPS_PROXY` and trust the local CA
+  (`agent-trace ca` / `NODE_EXTRA_CA_CERTS`). `exec --mitm` wires both for you.
 - **serve / token-level RL**: an OpenAI-compatible inference server that returns
   token ids + logprobs (e.g. vLLM `return_token_ids`, or SGLang with a logprobs patch).
 
