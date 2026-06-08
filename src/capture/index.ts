@@ -51,3 +51,21 @@ export {
   upstreamsFromRoutes,
   childEnvOverrides,
 } from "./execEnv.js";
+export { ForwardProxy, type ForwardProxyConfig } from "./forward/mitmProxy.js";
+export { MitmCA, type LeafCert, wildcardParent } from "./forward/ca.js";
+export {
+  deframe,
+  decompressFrame,
+  decodeMessageFrames,
+  type ConnectFrame,
+} from "./forward/connect.js";
+export { collectJsonValues, collectRoleMessages, type ScanOptions } from "./forward/protoScan.js";
+export {
+  cursorDecoder,
+  jsonDecoder,
+  defaultDecoders,
+  decodeExchange,
+  type WireDecoder,
+  type HttpExchange,
+  type DecodedCapture,
+} from "./forward/decoders/index.js";
