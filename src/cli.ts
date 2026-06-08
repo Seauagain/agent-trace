@@ -69,6 +69,33 @@ function flagStr(flags: Flags, key: string, fallback?: string): string | undefin
   return typeof v === "string" ? v : fallback;
 }
 
+function isTruthyEnv(v: string | undefined): boolean {
+  return v !== undefined && v !== "" && v !== "0" && v.toLowerCase() !== "false";
+}
+
+/**
+ * Whether `exec` may write to the terminal. Off by default so the wrapper never
+ * intrudes on an agent's TUI (Claude Code etc.); opt in with --verbose or
+ * AGENT_TRACE_VERBOSE=1. When quiet, even the capture proxy's per-request logs
+ * are suppressed (they'd otherwise corrupt the TUI on stdout).
+ */
+function execVerbose(flags: Flags): boolean {
+  return flags["verbose"] === true || isTruthyEnv(process.env["AGENT_TRACE_VERBOSE"]);
+}
+
+const SILENT_LOGGER: Pick<Console, "info" | "warn" | "error"> = {
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
+
+/** Logger for exec-spawned proxies: silent unless verbose, and always to stderr. */
+function execLogger(verbose: boolean): Pick<Console, "info" | "warn" | "error"> {
+  if (!verbose) return SILENT_LOGGER;
+  const toErr = (...args: unknown[]): void => console.error(...args);
+  return { info: toErr, warn: toErr, error: toErr };
+}
+
 async function serve(flags: Flags): Promise<void> {
   const inferenceBaseUrl = flagStr(flags, "inference-base-url") ?? process.env["INFERENCE_BASE_URL"];
   const modelServed = flagStr(flags, "model") ?? process.env["MODEL_SERVED"];
@@ -171,6 +198,7 @@ async function exec(childArgv: string[], flags: Flags): Promise<void> {
   const host = flagStr(flags, "host") ?? "127.0.0.1";
   const saveDir = flagStr(flags, "save-dir") ?? process.env["AGENT_TRACE_SAVE_DIR"] ?? null;
   const sessionId = flagStr(flags, "session-id") ?? "capture";
+  const verbose = execVerbose(flags);
 
   // Externals (and thus whether we must spawn a proxy) don't depend on the port.
   const probe = planTraceRoutes(process.env, `http://${host}:0`);
@@ -183,6 +211,7 @@ async function exec(childArgv: string[], flags: Flags): Promise<void> {
       defaultSessionId: sessionId,
       saveDir,
       defaultBuilder: flagStr(flags, "builder") ?? "prefix_merging",
+      logger: execLogger(verbose),
     });
     let bound: number;
     try {
@@ -197,16 +226,22 @@ async function exec(childArgv: string[], flags: Flags): Promise<void> {
   }
   const localProxyBaseUrl = routes.find((r) => !r.external)?.childBaseUrl ?? `http://${host}:0`;
 
-  console.error(`agent-trace exec: tracing \`${childArgv.join(" ")}\``);
-  for (const r of routes) {
-    if (r.external) console.error(`  ${r.baseVar} -> ${r.childBaseUrl}  (external trace proxy)`);
-    else console.error(`  ${r.baseVar} -> ${r.childBaseUrl}  (proxy -> ${r.upstream ?? "public default"})`);
+  // Quiet by default: the wrapper must not scribble over the agent's TUI.
+  if (verbose) {
+    console.error(`agent-trace exec: tracing \`${childArgv.join(" ")}\``);
+    for (const r of routes) {
+      if (r.external) console.error(`  ${r.baseVar} -> ${r.childBaseUrl}  (external trace proxy)`);
+      else
+        console.error(
+          `  ${r.baseVar} -> ${r.childBaseUrl}  (proxy -> ${r.upstream ?? "public default"})`,
+        );
+    }
+    if (proxy && saveDir) console.error(`  saving completions under ${saveDir}`);
+    else if (proxy)
+      console.error(
+        `  (no --save-dir: in-memory; GET ${localProxyBaseUrl}/sessions/${sessionId}/completions)`,
+      );
   }
-  if (proxy && saveDir) console.error(`  saving completions under ${saveDir}`);
-  else if (proxy)
-    console.error(
-      `  (no --save-dir: in-memory; GET ${localProxyBaseUrl}/sessions/${sessionId}/completions)`,
-    );
 
   const overrides = childEnvOverrides(routes);
   const child = spawn(childArgv[0]!, childArgv.slice(1), {
@@ -251,6 +286,7 @@ async function execMitm(childArgv: string[], flags: Flags): Promise<void> {
   const host = flagStr(flags, "host") ?? "127.0.0.1";
   const saveDir = flagStr(flags, "save-dir") ?? process.env["AGENT_TRACE_SAVE_DIR"] ?? null;
   const sessionId = flagStr(flags, "session-id") ?? "forward";
+  const verbose = execVerbose(flags);
 
   const proxy = new ForwardProxy({
     saveDir,
@@ -258,7 +294,7 @@ async function execMitm(childArgv: string[], flags: Flags): Promise<void> {
     mitmHosts: mitmHostsFromFlags(flags),
     mitmAll: flags["mitm-all"] === true,
     caDir: flagStr(flags, "ca-dir"),
-    logger: { info: console.error, warn: console.error, error: console.error },
+    logger: execLogger(verbose),
   });
   let bound: number;
   try {
@@ -269,14 +305,19 @@ async function execMitm(childArgv: string[], flags: Flags): Promise<void> {
   }
   const proxyUrl = `http://${host}:${bound}`;
 
-  console.error(`agent-trace exec --mitm: tracing \`${childArgv.join(" ")}\` via TLS interception`);
-  console.error(`  HTTPS_PROXY=${proxyUrl}  NODE_EXTRA_CA_CERTS=${proxy.caCertPath}`);
-  console.error(`  intercepting: ${flags["mitm-all"] === true ? "all hosts" : (mitmHostsFromFlags(flags) ?? ["cursor.sh", "anthropic.com", "openai.com"]).join(", ")}`);
-  if (saveDir) console.error(`  saving completions under ${saveDir}`);
-  else
+  // Quiet by default so the agent's TUI stays clean.
+  if (verbose) {
+    console.error(`agent-trace exec --mitm: tracing \`${childArgv.join(" ")}\` via TLS interception`);
+    console.error(`  HTTPS_PROXY=${proxyUrl}  NODE_EXTRA_CA_CERTS=${proxy.caCertPath}`);
     console.error(
-      `  (no --save-dir: in-memory; GET ${proxyUrl}/sessions/${sessionId}/completions is not exposed in forward mode)`,
+      `  intercepting: ${flags["mitm-all"] === true ? "all hosts" : (mitmHostsFromFlags(flags) ?? ["cursor.sh", "anthropic.com", "openai.com"]).join(", ")}`,
     );
+    if (saveDir) console.error(`  saving completions under ${saveDir}`);
+    else
+      console.error(
+        `  (no --save-dir: in-memory; GET ${proxyUrl}/sessions/${sessionId}/completions is not exposed in forward mode)`,
+      );
+  }
 
   const overrides: Record<string, string> = {
     HTTP_PROXY: proxyUrl,
@@ -577,7 +618,7 @@ async function main(): Promise<void> {
           "Usage:",
           "  agent-trace install   [--command claude] [--save-dir DIR] [--shell bash|zsh] [--rc PATH] [--print]",
           "  agent-trace uninstall [--command claude] [--shell bash|zsh] [--rc PATH]",
-          "  agent-trace exec      [--mitm] [--port N] [--save-dir DIR] [--session-id ID] -- <agent command...>",
+          "  agent-trace exec      [--mitm] [--verbose] [--port N] [--save-dir DIR] [--session-id ID] -- <agent command...>",
           "  agent-trace capture   [--port 8787] [--anthropic-base-url URL] [--openai-base-url URL]",
           "                       [--upstream-base-url URL] [--session-id ID] [--save-dir DIR]",
           "  agent-trace forward   [--port 8788] [--mitm-host h1,h2] [--mitm-all] [--save-dir DIR] [--session-id ID]",
@@ -588,6 +629,8 @@ async function main(): Promise<void> {
           "`install` adds a transparent shell wrapper so just running `claude`",
           "interactively auto-captures to a default dir (~/.agent-trace/captures) —",
           "no per-run typing, and your canonical ANTHROPIC_BASE_URL is left untouched.",
+          "`exec` is silent by default (never touches the agent's TUI); pass --verbose",
+          "or set AGENT_TRACE_VERBOSE=1 to see routing + per-request capture logs.",
           "Under the hood it uses `exec`, which routes only the child's *_BASE_URL",
           "through a capture proxy and forwards to your real backend. `capture` runs",
           "the proxy standalone; `serve` is the self-hosted path that also captures",
