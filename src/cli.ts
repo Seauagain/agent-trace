@@ -20,6 +20,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { CaptureProxy } from "./capture/server.js";
+import { ForwardProxy } from "./capture/forward/mitmProxy.js";
+import { MitmCA } from "./capture/forward/ca.js";
 import {
   childEnvOverrides,
   needsLocalProxy,
@@ -161,6 +163,9 @@ async function exec(childArgv: string[], flags: Flags): Promise<void> {
     console.error("exec requires a command after `--`, e.g. agent-trace exec -- claude");
     process.exit(1);
   }
+  // MITM mode captures clients that ignore *_BASE_URL (e.g. cursor-agent) by
+  // routing HTTPS_PROXY through a TLS-intercepting proxy + a trusted local CA.
+  if (flags["mitm"] === true) return execMitm(childArgv, flags);
   // Default port 0 = ephemeral, so concurrent interactive sessions never collide.
   const requestedPort = Number(flagStr(flags, "port") ?? process.env["AGENT_TRACE_PORT"] ?? "0");
   const host = flagStr(flags, "host") ?? "127.0.0.1";
@@ -229,6 +234,135 @@ async function exec(childArgv: string[], flags: Flags): Promise<void> {
   process.off("SIGTERM", onTerm);
   if (proxy) await proxy.close();
   process.exit(code);
+}
+
+function mitmHostsFromFlags(flags: Flags): string[] | undefined {
+  const raw = flagStr(flags, "mitm-host");
+  if (!raw) return undefined;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Run an agent command behind the TLS-intercepting forward proxy. */
+async function execMitm(childArgv: string[], flags: Flags): Promise<void> {
+  const requestedPort = Number(flagStr(flags, "port") ?? process.env["AGENT_TRACE_PORT"] ?? "0");
+  const host = flagStr(flags, "host") ?? "127.0.0.1";
+  const saveDir = flagStr(flags, "save-dir") ?? process.env["AGENT_TRACE_SAVE_DIR"] ?? null;
+  const sessionId = flagStr(flags, "session-id") ?? "forward";
+
+  const proxy = new ForwardProxy({
+    saveDir,
+    defaultSessionId: sessionId,
+    mitmHosts: mitmHostsFromFlags(flags),
+    mitmAll: flags["mitm-all"] === true,
+    caDir: flagStr(flags, "ca-dir"),
+    logger: { info: console.error, warn: console.error, error: console.error },
+  });
+  let bound: number;
+  try {
+    bound = await proxy.listen(requestedPort, host);
+  } catch (err) {
+    console.error(`agent-trace exec --mitm: could not start forward proxy: ${String(err)}`);
+    process.exit(1);
+  }
+  const proxyUrl = `http://${host}:${bound}`;
+
+  console.error(`agent-trace exec --mitm: tracing \`${childArgv.join(" ")}\` via TLS interception`);
+  console.error(`  HTTPS_PROXY=${proxyUrl}  NODE_EXTRA_CA_CERTS=${proxy.caCertPath}`);
+  console.error(`  intercepting: ${flags["mitm-all"] === true ? "all hosts" : (mitmHostsFromFlags(flags) ?? ["cursor.sh", "anthropic.com", "openai.com"]).join(", ")}`);
+  if (saveDir) console.error(`  saving completions under ${saveDir}`);
+  else
+    console.error(
+      `  (no --save-dir: in-memory; GET ${proxyUrl}/sessions/${sessionId}/completions is not exposed in forward mode)`,
+    );
+
+  const overrides: Record<string, string> = {
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    ALL_PROXY: proxyUrl,
+    NODE_EXTRA_CA_CERTS: proxy.caCertPath,
+  };
+  const child = spawn(childArgv[0]!, childArgv.slice(1), {
+    stdio: "inherit",
+    env: { ...process.env, ...overrides },
+  });
+
+  const relay = (sig: NodeJS.Signals) => () => {
+    if (!child.killed) child.kill(sig);
+  };
+  const onInt = relay("SIGINT");
+  const onTerm = relay("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+
+  const code: number = await new Promise((resolve) => {
+    child.on("exit", (c, signal) => resolve(signal ? 1 : (c ?? 0)));
+    child.on("error", (err) => {
+      console.error(`agent-trace exec --mitm: failed to start \`${childArgv[0]}\`: ${err.message}`);
+      resolve(127);
+    });
+  });
+
+  process.off("SIGINT", onInt);
+  process.off("SIGTERM", onTerm);
+  await proxy.close();
+  process.exit(code);
+}
+
+/** Run the TLS-intercepting forward proxy standalone (set HTTPS_PROXY yourself). */
+async function forward(flags: Flags): Promise<void> {
+  const port = Number(flagStr(flags, "port") ?? process.env["PORT"] ?? "8788");
+  const host = flagStr(flags, "host") ?? "127.0.0.1";
+  const saveDir = flagStr(flags, "save-dir") ?? null;
+  const sessionId = flagStr(flags, "session-id") ?? "forward";
+
+  const proxy = new ForwardProxy({
+    saveDir,
+    defaultSessionId: sessionId,
+    mitmHosts: mitmHostsFromFlags(flags),
+    mitmAll: flags["mitm-all"] === true,
+    caDir: flagStr(flags, "ca-dir"),
+  });
+  let bound: number;
+  try {
+    bound = await proxy.listen(port, host);
+  } catch (err) {
+    console.error(`agent-trace forward: could not start forward proxy: ${String(err)}`);
+    process.exit(1);
+  }
+  const proxyUrl = `http://${host}:${bound}`;
+  console.info(`agent-trace forward proxy (TLS MITM) listening on ${proxyUrl}`);
+  console.info(`  point your agent at it, in its own shell:`);
+  console.info(`    export HTTPS_PROXY=${proxyUrl}`);
+  console.info(`    export NODE_EXTRA_CA_CERTS=${proxy.caCertPath}`);
+  console.info(
+    `  intercepting: ${flags["mitm-all"] === true ? "all hosts" : (mitmHostsFromFlags(flags) ?? ["cursor.sh", "anthropic.com", "openai.com"]).join(", ")}`,
+  );
+  if (saveDir) console.info(`  persisting completions under ${saveDir}`);
+  else console.info(`  (no --save-dir: captures kept in memory only)`);
+  console.info(`  session id for this run: ${sessionId}`);
+
+  const shutdown = (): void => {
+    void proxy.close().then(() => process.exit(0));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+/** Ensure the local root CA exists and print its path (for trust setup). */
+function ca(flags: Flags): void {
+  const mitmCa = MitmCA.loadOrCreate(flagStr(flags, "ca-dir"));
+  if (flags["print"] === true) {
+    process.stdout.write(`${mitmCa.caCertPem}\n`);
+    return;
+  }
+  console.info(`agent-trace root CA: ${mitmCa.certPath}`);
+  console.info(`  Node clients:  export NODE_EXTRA_CA_CERTS=${mitmCa.certPath}`);
+  console.info(`  print the PEM: agent-trace ca --print`);
 }
 
 function detectShell(flags: Flags): ShellKind {
@@ -423,6 +557,12 @@ async function main(): Promise<void> {
     case "capture":
       await capture(flags);
       break;
+    case "forward":
+      await forward(flags);
+      break;
+    case "ca":
+      ca(flags);
+      break;
     case "serve":
       await serve(flags);
       break;
@@ -437,9 +577,11 @@ async function main(): Promise<void> {
           "Usage:",
           "  agent-trace install   [--command claude] [--save-dir DIR] [--shell bash|zsh] [--rc PATH] [--print]",
           "  agent-trace uninstall [--command claude] [--shell bash|zsh] [--rc PATH]",
-          "  agent-trace exec      [--port N] [--save-dir DIR] [--session-id ID] -- <agent command...>",
+          "  agent-trace exec      [--mitm] [--port N] [--save-dir DIR] [--session-id ID] -- <agent command...>",
           "  agent-trace capture   [--port 8787] [--anthropic-base-url URL] [--openai-base-url URL]",
           "                       [--upstream-base-url URL] [--session-id ID] [--save-dir DIR]",
+          "  agent-trace forward   [--port 8788] [--mitm-host h1,h2] [--mitm-all] [--save-dir DIR] [--session-id ID]",
+          "  agent-trace ca        [--print] [--ca-dir DIR]",
           "  agent-trace serve     --inference-base-url URL --model NAME [--engine vllm] [--port 8080] [--save-dir DIR]",
           "  agent-trace build     <records-dir> [--builder prefix_merging] [--format rl|sft|trajectory] [--out FILE] [--include-tokens]",
           "",
@@ -450,6 +592,11 @@ async function main(): Promise<void> {
           "through a capture proxy and forwards to your real backend. `capture` runs",
           "the proxy standalone; `serve` is the self-hosted path that also captures",
           "token ids + logprobs for token-level RL.",
+          "",
+          "`forward` (and `exec --mitm`) is the TLS-intercepting path for clients that",
+          "ignore *_BASE_URL or speak a non-JSON wire (e.g. cursor-agent's protobuf):",
+          "the agent uses HTTPS_PROXY + trusts the local CA (`agent-trace ca`), and",
+          "recognized turns are decoded to OpenAI-chat and saved like any capture.",
         ].join("\n"),
       );
       process.exit(command ? 1 : 0);
